@@ -314,29 +314,31 @@ class SlideData:
                 client = dask.distributed.Client()
                 shutdown_after = True
 
-            # map pipeline application onto each tile
-            processed_tile_futures = []
+            # # map pipeline application onto each tile
+            # processed_tile_futures = []
 
-            for tile in self.generate_tiles(
+            tiles = self.generate_tiles(
                 level=level,
                 shape=tile_size,
                 stride=tile_stride,
                 pad=tile_pad,
                 **kwargs,
-            ):
+            )
+            for tile in tiles:
                 if not tile.slide_type:
                     tile.slide_type = self.slide_type
                 # explicitly scatter data, i.e. send the tile data out to the cluster before applying the pipeline
                 # according to dask, this can reduce scheduler burden and keep data on workers
-                big_future = client.scatter(tile)
-                f = client.submit(pipeline.apply, big_future)
-                processed_tile_futures.append(f)
-
-            # as tiles are processed, add them to h5
-            for future, tile in dask.distributed.as_completed(
-                processed_tile_futures, with_results=True
-            ):
-                self.tiles.add(tile)
+            big_future = client.scatter(tiles)
+            f = client.submit(pipeline.apply, big_future)
+            # processed_tile_futures.append(f)
+            self.tiles = f.result()
+            #
+            # # as tiles are processed, add them to h5
+            # for future, tile in dask.distributed.as_completed(
+            #     processed_tile_futures, with_results=True
+            # ):
+            #     self.tiles.add(tile)
 
             if shutdown_after:
                 client.shutdown()
