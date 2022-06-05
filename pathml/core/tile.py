@@ -9,6 +9,7 @@ from collections import OrderedDict
 import matplotlib.pyplot as plt
 import h5py
 import reprlib
+from loguru import logger
 
 import pathml.core.masks
 
@@ -108,7 +109,7 @@ class Tile:
             # remove any Nones
             stain_type_dict = {key: val for key, val in stain_type_dict.items() if val}
             if stain_type_dict:
-                slide_type = pathml.core.types.SlideType(**stain_type_dict)
+                slide_type = pathml.core.slide_types.SlideType(**stain_type_dict)
 
         assert counts is None or isinstance(
             counts, anndata.AnnData

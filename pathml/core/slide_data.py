@@ -8,6 +8,7 @@ import reprlib
 from pathlib import Path
 
 import anndata
+from loguru import logger
 import dask.distributed
 import h5py
 import matplotlib.pyplot as plt
@@ -15,33 +16,29 @@ import numpy as np
 import pathml.core
 import pathml.preprocessing.pipeline
 from pathml.core.slide_types import SlideType
-from torch.utils.data import Dataset
 
 
-def get_file_ext(path):
+def infer_backend(path):
     """
-    Return the file extension of an input path.
-    If zipped with 'gz' or 'bz2' extension, will instead return the second to last extension.
-    If multiple extensions, will return the last two.
+    Checks file extensions to try to infer correct backend to use.
+    Uses the file extensions from the sets contained in this file (pathml/core/slide_data.py)
+    For file formats which are supported by both openslide and bioformats, will return "bioformats".
 
     Args:
         path: path to file
 
     Returns:
-        str: file extension
+        str: one of "bioformats", "openslide", "dicom", "h5path"
     """
-    p = Path(path)
-    ext = p.suffixes
-    if not ext:
-        raise Exception(f"invalid path has no file extension: {path}")
-    elif len(ext) == 1:
-        ext = ext[0]
-    elif len(ext) >= 2:
-        if ext[-1] in {".gz", ".bz2"}:
-            ext = ext[-2]
-        else:
-            ext = "".join(ext[-2:])
-    return ext
+    path = str(path)
+    for extension_set, name in zip(
+        [pathmlext, bioformatsext, openslideext, dicomext],
+        ["h5path", "bioformats", "openslide", "dicom"],
+    ):
+        for ext in extension_set:
+            if path[-len(ext) :] == ext:
+                return name
+    raise ValueError(f"input path {path} doesn't match any supported file extensions")
 
 
 class SlideData:
@@ -55,8 +52,11 @@ class SlideData:
         tiles (pathml.core.Tiles, optional): object containing {coordinates, tile} pairs
         labels (collections.OrderedDict, optional): dictionary containing {key, label} pairs
         backend (str, optional): backend to use for interfacing with slide on disk.
-            Must be one of {"OpenSlide", "BioFormats", "DICOM"} (case-insensitive).
+            Must be one of {"OpenSlide", "BioFormats", "DICOM", "h5path"} (case-insensitive).
+            Note that for supported image formats, OpenSlide performance can be significantly better than BioFormats.
+            Consider specifying ``backend = "openslide"`` when possible.
             If ``None``, and a ``filepath`` is provided, tries to infer the correct backend from the file extension.
+            Defaults to ``None``.
         slide_type (pathml.core.SlideType, optional): slide type specification. Must be a
             :class:`~pathml.core.SlideType` object. Alternatively, slide type can be specified by using the
             parameters ``stain``, ``tma``, ``rgb``, ``volumetric``, and ``time_series``.
@@ -91,6 +91,7 @@ class SlideData:
         volumetric=None,
         time_series=None,
         counts=None,
+        dtype=None,
     ):
         # check inputs
         assert masks is None or isinstance(
@@ -120,8 +121,8 @@ class SlideData:
         ), f"slide_type is of type {type(slide_type)} but must be of type pathml.core.types.SlideType"
         assert backend is None or (
             isinstance(backend, str)
-            and backend.lower() in {"openslide", "bioformats", "dicom"}
-        ), f"backend {backend} must be one of ['OpenSlide', 'BioFormats', 'DICOM'] (case-insensitive)."
+            and backend.lower() in {"openslide", "bioformats", "dicom", "h5path"}
+        ), f"backend {backend} must be one of ['OpenSlide', 'BioFormats', 'DICOM', 'h5path'] (case-insensitive)."
         assert counts is None or isinstance(
             counts, anndata.AnnData
         ), f"counts is if type {type(counts)} but must be of type anndata.AnnData"
@@ -145,7 +146,7 @@ class SlideData:
 
         # get name from filepath if no name is provided
         if name is None and filepath is not None:
-            name = Path(filepath).stem
+            name = Path(filepath).name
 
         _load_from_h5path = False
 
@@ -154,26 +155,14 @@ class SlideData:
             backend = backend.lower()
         else:
             # try to infer the correct backend
-            ext = get_file_ext(filepath)
-            if ext in openslideext:
-                backend = "openslide"
-            elif ext in bioformatsext:
-                backend = "bioformats"
-            elif ext in dicomext:
-                backend = "dicom"
-            elif ext in pathmlext:
-                backend = "h5path"
-                # load SlideData from h5 or h5path
+            backend = infer_backend(filepath)
+            if backend == "h5path":
                 _load_from_h5path = True
-            else:
-                raise ValueError(
-                    f"Backend not specified, but cannot infer correct backend from input path {filepath}"
-                )
 
         if backend.lower() == "openslide":
             backend_obj = pathml.core.OpenSlideBackend(filepath)
         elif backend.lower() == "bioformats":
-            backend_obj = pathml.core.BioFormatsBackend(filepath)
+            backend_obj = pathml.core.BioFormatsBackend(filepath, dtype)
         elif backend.lower() == "dicom":
             backend_obj = pathml.core.DICOMBackend(filepath)
         elif backend.lower() == "h5path":
@@ -279,6 +268,7 @@ class SlideData:
             write_dir (str): Path to directory to write the processed slide to. The processed SlideData object
                 will be written to the directory immediately after the pipeline has completed running.
                 The filepath will default to "<write_dir>/<slide.name>.h5path. Defaults to ``None``.
+            **kwargs: Other arguments passed through to ``generate_tiles()`` method of the backend.
         """
         assert isinstance(
             pipeline, pathml.preprocessing.pipeline.Pipeline
@@ -289,8 +279,7 @@ class SlideData:
             # in this case, tiles already exist
             if not overwrite_existing_tiles:
                 raise Exception(
-                    "Slide already has tiles. Running the pipeline will overwrite the existing tiles."
-                    "use overwrite_existing_tiles=True to force overwriting existing tiles."
+                    f"Slide already has tiles. Running the pipeline will overwrite the existing tiles. Use overwrite_existing_tiles=True to force overwriting existing tiles."
                 )
             else:
                 # delete all existing tiles
@@ -313,6 +302,9 @@ class SlideData:
             if client is None:
                 client = dask.distributed.Client()
                 shutdown_after = True
+                logger.info(
+                    f"creating a default distributed.Client(): {client.scheduler_info()}"
+                )
 
             # # map pipeline application onto each tile
             # processed_tile_futures = []
@@ -383,8 +375,8 @@ class SlideData:
             location (Tuple[int, int]): Location of top-left corner of tile (i, j)
             size (Union[int, Tuple[int, int]]): Size of each tile. May be a tuple of (height, width) or a
                 single integer, in which case square tiles of that size are generated.
-            *args: positional arguments passed through
-            **kwargs: keyword arguments passed through
+            *args: positional arguments passed through to ``extract_region()`` method of the backend.
+            **kwargs: keyword arguments passed through to ``extract_region()`` method of the backend.
 
         Returns:
             np.ndarray: image at the specified region
@@ -455,7 +447,7 @@ class SlideData:
         except:
             if not self.slide:
                 raise NotImplementedError(
-                    "Plotting only supported via backend, but SlideData has no backend."
+                    f"Plotting only supported via backend, but SlideData has no backend."
                 )
             else:
                 raise NotImplementedError(
@@ -481,7 +473,7 @@ class SlideData:
             self.tiles.h5manager.counts = value
         else:
             raise AttributeError(
-                "cannot assign counts slidedata contains no tiles, first generate tiles"
+                f"cannot assign counts slidedata contains no tiles, first generate tiles"
             )
 
     def write(self, path):

@@ -8,6 +8,7 @@ from typing import Tuple
 
 import numpy as np
 import openslide
+from loguru import logger
 import pathml.core
 import pathml.core.tile
 from javabridge.jutil import JavaException
@@ -26,12 +27,9 @@ try:
     import javabridge
     from bioformats.metadatatools import createOMEXMLMetadata
 except ImportError:
+    logger.exception("Unable to import bioformats, javabridge")
     raise Exception(
-        """Installation of PathML not complete. Please install openjdk8, bioformats, and javabridge:
-            conda install openjdk==8.0.152
-            pip install javabridge==1.0.19 python-bioformats==4.0.0
-
-            For detailed installation instructions, please see https://github.com/Dana-Farber-AIOS/pathml/"""
+        f"Installation of PathML not complete. Please install openjdk8, bioformats, and javabridge:\nconda install openjdk==8.0.152\npip install javabridge==1.0.19 python-bioformats==4.0.0\nFor detailed installation instructions, please see https://github.com/Dana-Farber-AIOS/pathml/"
     )
 
 
@@ -62,6 +60,7 @@ class OpenSlideBackend(SlideBackend):
     """
 
     def __init__(self, filename):
+        logger.info(f"OpenSlideBackend loading file at: {filename}")
         self.filename = filename
         self.slide = openslide.open_slide(filename=filename)
         self.level_count = self.slide.level_count
@@ -198,16 +197,19 @@ class OpenSlideBackend(SlideBackend):
 
         stride_i, stride_j = stride
 
-        if pad:
-            n_chunk_i = i // stride_i + 1
-            n_chunk_j = j // stride_j + 1
-
+        # calculate number of expected tiles
+        # check for tile shape evenly dividing slide shape to fix https://github.com/Dana-Farber-AIOS/pathml/issues/305
+        if pad and i % stride_i != 0:
+            n_tiles_i = i // stride_i + 1
         else:
-            n_chunk_i = (i - shape[0]) // stride_i + 1
-            n_chunk_j = (j - shape[1]) // stride_j + 1
+            n_tiles_i = (i - shape[0]) // stride_i + 1
+        if pad and j % stride_j != 0:
+            n_tiles_j = j // stride_j + 1
+        else:
+            n_tiles_j = (j - shape[1]) // stride_j + 1
 
-        for ix_i in range(n_chunk_i):
-            for ix_j in range(n_chunk_j):
+        for ix_i in range(n_tiles_i):
+            for ix_j in range(n_tiles_j):
                 coords = (int(ix_i * stride_i), int(ix_j * stride_j))
                 # get image for tile
                 tile_im = self.extract_region(location=coords, size=shape, level=level)
@@ -237,6 +239,7 @@ def _init_logger():
     javabridge.call(
         rootLogger, "setLevel", "(Lch/qos/logback/classic/Level;)V", logLevel
     )
+    logger.info("silenced javabridge logging")
 
 
 class BioFormatsBackend(SlideBackend):
@@ -252,10 +255,15 @@ class BioFormatsBackend(SlideBackend):
         filename (str): path to image file on disk
         dtype (numpy.dtype): data type of image. If ``None``, will use BioFormats to infer the data type from the
             image's OME metadata. Defaults to ``None``.
+
+    Note:
+        While the Bio-Formats convention uses XYZCT channel order, we use YXZCT for compatibility with the rest of
+        PathML which is based on (i, j) coordinate system.
     """
 
     def __init__(self, filename, dtype=None):
         self.filename = filename
+        logger.info(f"BioFormatsBackend loading file at: {filename}")
         # init java virtual machine
         javabridge.start_vm(class_path=bioformats.JARS, max_heap_size="50G")
         # disable verbose JVM logging if possible
@@ -270,6 +278,7 @@ class BioFormatsBackend(SlideBackend):
         reader.setMetadataStore(omeMeta)
         reader.setId(str(self.filename))
         seriesCount = reader.getSeriesCount()
+        logger.info(f"Found n={seriesCount} series in image")
 
         sizeSeries = []
         for s in range(seriesCount):
@@ -281,7 +290,8 @@ class BioFormatsBackend(SlideBackend):
                 reader.getSizeC(),
                 reader.getSizeT(),
             )
-            sizeSeries.append((sizex, sizey, sizez, sizec, sizet))
+            # use yxzct for compatibility with the rest of PathML which uses i,j coords (not x, y)
+            sizeSeries.append((sizey, sizex, sizez, sizec, sizet))
         s = [s[0] * s[1] for s in sizeSeries]
 
         self.level_count = seriesCount  # count of levels
@@ -289,11 +299,14 @@ class BioFormatsBackend(SlideBackend):
         self.shape_list = sizeSeries  # shape on all levels
         self.metadata = bioformats.get_omexml_metadata(self.filename)
 
+        logger.info(f"Bioformats OMEXML metadata: {self.metadata}")
+
         if dtype:
             assert isinstance(
                 dtype, np.dtype
             ), f"dtype is of type {type(dtype)}. Must be a np.dtype"
             self.pixel_dtype = dtype
+            logger.info(f"Using specified dtype: {dtype}")
         else:
             # infer pixel data type from metadata
             # map from ome pixel datatypes to numpy types. Based on:
@@ -313,9 +326,12 @@ class BioFormatsBackend(SlideBackend):
             ome_pixeltype = (
                 bioformats.OMEXML(self.metadata).image().Pixels.get_PixelType()
             )
+            logger.info(f"Using pixel dtype found in OME metadata: {ome_pixeltype}")
             try:
                 self.pixel_dtype = pixel_dtype_map[ome_pixeltype]
+                logger.info(f"Found corresponding dtype: {self.pixel_dtype}")
             except:
+                logger.exception("datatype from metadata not found in pixel_dtype_map")
                 raise Exception(
                     f"pixel type '{ome_pixeltype}' detected from OME metadata not recognized."
                 )
@@ -332,7 +348,7 @@ class BioFormatsBackend(SlideBackend):
                 Defaults to ``None``.
 
         Returns:
-            Tuple[int, int]: Shape of image (H, W)
+            Tuple[int, int]: Shape of image (i, j) at target level
         """
         if level is None:
             return self.shape[:2]
@@ -343,25 +359,29 @@ class BioFormatsBackend(SlideBackend):
             ), f"input level {level} invalid for slide with {self.level_count} levels total"
             return self.shape_list[level][:2]
 
-    def extract_region(self, location, size, level=0, series_as_channels=False):
+    def extract_region(
+        self, location, size, level=0, series_as_channels=False, normalize=True
+    ):
         """
         Extract a region of the image. All bioformats images have 5 dimensions representing
-        (x, y, z, channel, time). Even if an image does not have multiple z-series or time-series,
-        those dimensions will still be kept. For example, a standard RGB image will be of shape (x, y, 1, 3, 1).
+        (i, j, z, channel, time). Even if an image does not have multiple z-series or time-series,
+        those dimensions will still be kept. For example, a standard RGB image will be of shape (i, j, 1, 3, 1).
         If a tuple with len < 5 is passed, missing dimensions will be
         retrieved in full.
 
         Args:
-            location (Tuple[int, int]): (X,Y) location of corner of extracted region closest to the origin.
-            size (Tuple[int, int, ...]): (X,Y) size of each region. If an integer is passed, will convert to a
-            tuple of (H, W) and extract a square region. If a tuple with len < 5 is passed, missing
+            location (Tuple[int, int]): (i, j) location of corner of extracted region closest to the origin.
+            size (Tuple[int, int, ...]): (i, j) size of each region. If an integer is passed, will convert to a
+            tuple of (i, j) and extract a square region. If a tuple with len < 5 is passed, missing
                 dimensions will be retrieved in full.
             level (int): level from which to extract chunks. Level 0 is highest resolution. Defaults to 0.
             series_as_channels (bool): Whether to treat image series as channels. If ``True``, multi-level images
                 are not supported. Defaults to ``False``.
+            normalize (bool, optional): Whether to normalize the image to int8 before returning. Defaults to True.
+                If False, image will be returned as-is immediately after reading, typically in float64.
 
         Returns:
-            np.ndarray: image at the specified region. 5-D array of (x, y, z, c, t)
+            np.ndarray: image at the specified region. 5-D array of (i, j, z, c, t)
         """
         if level is None:
             level = 0
@@ -391,19 +411,26 @@ class BioFormatsBackend(SlideBackend):
                 f"input size {size} invalid. Must be a tuple of integer coordinates of len<2"
             )
         if series_as_channels:
-            assert (
-                level == 0
-            ), f"Multi-level images not supported with series_as_channels=True. Input 'level={level}' invalid. Use 'level=0'."
+            logger.info(f"using series_as_channels=True")
+            if level != 0:
+                logger.exception(
+                    f"When series_as_channels=True, must use level=0. Input 'level={level}' invalid."
+                )
+                raise ValueError(
+                    f"Multi-level images not supported with series_as_channels=True. Input 'level={level}' invalid. Use 'level=0'."
+                )
 
         javabridge.start_vm(class_path=bioformats.JARS, max_heap_size="100G")
         with bioformats.ImageReader(str(self.filename), perform_init=True) as reader:
             # expand size
+            logger.info(f"extracting region with input size = {size}")
             size = list(size)
             arrayshape = list(size)
             for i in range(len(self.shape_list[level])):
                 if i > len(size) - 1:
                     arrayshape.append(self.shape_list[level][i])
             arrayshape = tuple(arrayshape)
+            logger.info(f"input size converted to {arrayshape}")
             array = np.empty(arrayshape)
 
             # read a very small region to check whether the image has channels incorrectly stored as series
@@ -412,12 +439,13 @@ class BioFormatsBackend(SlideBackend):
                 t=0,
                 series=level,
                 rescale=False,
-                XYWH=(location[0], location[1], 2, 2),
+                XYWH=(location[1], location[0], 2, 2),
             )
 
             # need this part because some facilities output images where the channels are incorrectly stored as series
             # in this case we pull the image for each series, then stack them together as channels
             if series_as_channels:
+                logger.info("reading series as channels")
                 for z in range(self.shape_list[level][2]):
                     for c in range(self.shape_list[level][3]):
                         for t in range(self.shape_list[level][4]):
@@ -426,15 +454,15 @@ class BioFormatsBackend(SlideBackend):
                                 t=t,
                                 series=c,
                                 rescale=False,
-                                XYWH=(location[0], location[1], size[0], size[1]),
+                                XYWH=(location[1], location[0], size[1], size[0]),
                             )
                             slicearray = np.asarray(slicearray)
                             # some file formats read x, y out of order, transpose
-                            slicearray = np.transpose(slicearray)
                             array[:, :, z, c, t] = slicearray
 
             # in this case, channels are correctly stored as channels, and we can support multi-level images as series
             else:
+                logger.info("reading image")
                 for z in range(self.shape_list[level][2]):
                     for t in range(self.shape_list[level][4]):
                         slicearray = reader.read(
@@ -442,26 +470,28 @@ class BioFormatsBackend(SlideBackend):
                             t=t,
                             series=level,
                             rescale=False,
-                            XYWH=(location[0], location[1], size[0], size[1]),
+                            XYWH=(location[1], location[0], size[1], size[0]),
                         )
                         slicearray = np.asarray(slicearray)
-                        # some file formats read x, y out of order, transpose
-                        if slicearray.shape[:2] != array.shape[:2]:
-                            slicearray = np.transpose(slicearray)
-                            # in 2d undoes transpose
-                            if len(sample.shape) == 3:
-                                slicearray = np.moveaxis(slicearray, 0, -1)
                         if len(sample.shape) == 3:
                             array[:, :, z, :, t] = slicearray
                         else:
                             array[:, :, z, level, t] = slicearray
 
-        # scale array before converting: https://github.com/Dana-Farber-AIOS/pathml/issues/271
-        # first scale to [0-1]
-        array_scaled = array / (2 ** (8 * self.pixel_dtype.itemsize))
-        # then scale to [0-255] and convert to 8 bit
-        array_scaled = array_scaled * 2 ** 8
-        return array_scaled.astype(np.uint8)
+        if not normalize:
+            logger.info("returning extracted region without normalizing dtype")
+            return array
+        else:
+            logger.info("normalizing extracted region to uint8")
+            # scale array before converting: https://github.com/Dana-Farber-AIOS/pathml/issues/271
+            # first scale to [0-1]
+            array_scaled = array / (2 ** (8 * self.pixel_dtype.itemsize))
+            logger.info(
+                f"Scaling image to [0, 1] by dividing by {(2 ** (8 * self.pixel_dtype.itemsize))}"
+            )
+            # then scale to [0-255] and convert to 8 bit
+            array_scaled = array_scaled * 2 ** 8
+            return array_scaled.astype(np.uint8)
 
     def get_thumbnail(self, size=None):
         """
@@ -515,6 +545,7 @@ class BioFormatsBackend(SlideBackend):
             pad (bool): How to handle tiles on the edges. If ``True``, these edge tiles will be zero-padded
                 and yielded with the other chunks. If ``False``, incomplete edge chunks will be ignored.
                 Defaults to ``False``.
+            **kwargs: Other arguments passed through to ``extract_region()`` method.
 
         Yields:
             pathml.core.tile.Tile: Extracted Tile object
@@ -535,6 +566,7 @@ class BioFormatsBackend(SlideBackend):
         ), f"input stride {stride} invalid. Must be a tuple of (stride_H, stride_W), or a single int"
 
         if stride is None:
+            logger.info(f"stride not specified, using stride=shape ({shape})")
             stride = shape
         elif isinstance(stride, int):
             stride = (stride, stride)
@@ -543,16 +575,21 @@ class BioFormatsBackend(SlideBackend):
 
         stride_i, stride_j = stride
 
-        if pad:
-            n_chunk_i = i // stride_i + 1
-            n_chunk_j = j // stride_j + 1
-
+        # calculate number of expected tiles
+        # check for tile shape evenly dividing slide shape to fix https://github.com/Dana-Farber-AIOS/pathml/issues/305
+        if pad and i % stride_i != 0:
+            n_tiles_i = i // stride_i + 1
         else:
-            n_chunk_i = (i - shape[0]) // stride_i + 1
-            n_chunk_j = (j - shape[1]) // stride_j + 1
+            n_tiles_i = (i - shape[0]) // stride_i + 1
+        if pad and j % stride_j != 0:
+            n_tiles_j = j // stride_j + 1
+        else:
+            n_tiles_j = (j - shape[1]) // stride_j + 1
 
-        for ix_i in range(n_chunk_i):
-            for ix_j in range(n_chunk_j):
+        logger.info(f"expected number of tiles: {n_tiles_i} x {n_tiles_j}")
+
+        for ix_i in range(n_tiles_i):
+            for ix_j in range(n_tiles_j):
                 coords = (int(ix_i * stride_i), int(ix_j * stride_j))
                 if coords[0] + shape[0] < i and coords[1] + shape[1] < j:
                     # get image for tile
@@ -591,6 +628,7 @@ class DICOMBackend(SlideBackend):
 
     def __init__(self, filename):
         self.filename = str(filename)
+        logger.info(f"DICOMBackend loading file at: {filename}")
         # read metadata fields of interest from DICOM, without reading the entire PixelArray
         tags = [
             "NumberOfFrames",
@@ -610,6 +648,9 @@ class DICOMBackend(SlideBackend):
         self.n_rows = -(-self.shape[0] // self.frame_shape[0])
         self.n_cols = -(-self.shape[1] // self.frame_shape[1])
         self.transfer_syntax_uid = UID(metadata.file_meta.TransferSyntaxUID)
+        logger.info(
+            f"DICOM metadata: frame_shape={self.frame_shape}, nrows = {self.n_rows}, ncols = {self.n_cols}"
+        )
 
         # actual file
         self.fp = DicomFile(self.filename, mode="rb")
@@ -702,9 +743,9 @@ class DICOMBackend(SlideBackend):
         frame_i, frame_j = self.frame_shape
         # frame size must evenly divide coords, otherwise we aren't on a frame corner
         if i % frame_i or j % frame_j:
+            logger.exception(f"i={i}, j={j}, frame shape = {self.frame_shape}")
             raise ValueError(
-                f"coords {coords} are not evenly divided by frame size {(frame_i, frame_j)}. "
-                f"Must provide coords at upper left corner of Frame."
+                f"coords {coords} are not evenly divided by frame size {(frame_i, frame_j)}. Must provide coords at upper left corner of Frame."
             )
 
         row_ix = i / frame_i
